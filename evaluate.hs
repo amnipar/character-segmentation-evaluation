@@ -1,13 +1,14 @@
 module Main where
 
 import CVSU.Types
-import CVSU.PixelImage as P
+import CVSU.PixelImage as CVSU
 import CVSU.Integral
 import CVSU.ConnectedComponents
 import CVSU.QuadForest
-import CVSU.OpenCV
 
 import CV.Image
+import CV.CVSU as CV
+import CV.CVSU.Rectangle
 import CV.Morphology
 import CV.Filters
 import CV.Matrix as M
@@ -49,78 +50,11 @@ createMask f s r =
 gaussianSmooth :: Float -> Int -> Image GrayScale D32 -> Image GrayScale D8
 gaussianSmooth s r img = unsafeImageTo8Bit $ convolve2D (createMask g s r) (r,r) img
 
--- | Generate a CVSU PixelImage from a CV Image
-fromCVImage :: Image GrayScale D8 -> IO (PixelImage)
-fromCVImage img = do
-  saveImage "temp.png" img
-  withGenImage img $ \pimg ->
-    fromIplImage (castPtr pimg)
-
--- | Generate a CV GrayScale Image from CVSU PixelImage
-toCVImageG :: PixelImage -> IO (Image GrayScale D8)
-toCVImageG img = creatingImage $ toBareImage $ toIplImage img
-  where
-    toBareImage :: IO (Ptr C'IplImage) -> IO (Ptr BareImage)
-    toBareImage = liftM castPtr
-
--- | Generate a CV RGB Image from CVSU PixelImage
-toCVImage :: PixelImage -> IO (Image RGB D8)
-toCVImage img = creatingImage $ toBareImage $ toIplImage img
-  where
-    toBareImage :: IO (Ptr C'IplImage) -> IO (Ptr BareImage)
-    toBareImage = liftM castPtr
-
--- | Draw rectangles over an image using the given color
-drawRects :: (D32,D32,D32) -> [R.Rectangle Int] -> Image RGB D32 -> Image RGB D32
-drawRects c rs img =
-  img <## [rectOp c 1 r | r <- rs]
-
 -- | Draw a quad forest into an image and save it to a file
 drawForest :: String -> QuadForest -> IO ()
 drawForest file forest = do
-  fimg <- toCVImage =<< quadForestDrawImage True True forest
-  saveImage file fimg
-
--- | Find the minimum covering rectangle for a collection of rectangles
-minCoveringRect :: [R.Rectangle Int] -> R.Rectangle Int
-minCoveringRect [] = Rectangle 0 0 0 0
-minCoveringRect rects = mkRectCorners (x1,y1) (x2,y2)
-  where
-    x1 = minimum $ map R.left rects
-    y1 = minimum $ map R.top rects
-    x2 = maximum $ map R.right rects
-    y2 = maximum $ map R.bottom rects
-
--- | Calculate the area of a rectangle by the coordinates of two corners. The
---   first corner should be the top left corner; if it isn't, the corners
---   correspond to an empty intersection of rectangles and the area is 0.
-area (x1,y1) (x2,y2)
-  | x2 > x1 && y2 > y1 = (x2-x1)*(y2-y1)
-  | otherwise = 0
-
--- | Convert a connected component to a rectangle
-compToRect :: ConnectedComponent -> R.Rectangle Int
-compToRect (ConnectedComponent x y w h _) = R.Rectangle x y w h
-
--- | Convert a segment to a rectangle
-segmentToRect :: ForestSegment -> R.Rectangle Int
-segmentToRect (ForestSegment _ x y w h _ _) = R.Rectangle x y w h
-
--- | Find the collection of rectangles that are larger than 256 pixels
---   and have width and height larger than 8, and that intersect the
---   given rectangle by more than 90%.
-getIntersectingRects :: [R.Rectangle Int] -> R.Rectangle Int
-    -> (R.Rectangle Int, R.Rectangle Int, [R.Rectangle Int])
-getIntersectingRects [] r = (r, Rectangle 0 0 0 0, [])
-getIntersectingRects rects r@(R.Rectangle rx ry rw rh) =
-  (r, minCoveringRect rects', rects')
-  where
-    rects' = filter (intersecting rx ry rw rh) $ filter bySize rects
-    bySize (R.Rectangle _ _ w h) = w > 8 && h > 8 && rArea r > 256
-    intersecting rx ry rw rh (R.Rectangle x y w h)
-      | area (max rx x, max ry y) (min (rx+rw) (x+w), min (ry+rh) (y+h))
-          > (round $ 0.9 * (fromIntegral $ w * h)) = True
-      | otherwise = False
+  saveImage file =<< expectByteRGB =<< fromPixelImage =<<
+    quadForestDrawImage True True forest
 
 -- | Folds two result objects together using the sum of its components.
 foldResults :: (Int, Int, Double, Double, Double)
@@ -134,22 +68,24 @@ foldResults (cnum,ccorrect,ccount,cratio,clargest)
 --   how many rects were available, how many were recovered correctly, how many
 --   parts were found, the sum of size ratios of discovered rects to ground truth,
 --   and the sum of ratios of largest rect to the covering rect.
-getResults :: [(R.Rectangle Int, R.Rectangle Int, [R.Rectangle Int])]
+getResults :: [(R.Rectangle Int, [R.Rectangle Int])]
     -> (Int, Int, Double, Double, Double)
 getResults rs = (snum, scorrect, scount, sratio, slargest)
   where
     -- number of rects under the max covering rect
-    count (_,_,r) = length r
+    count (_,r) = length r
     counts = map count rs
     -- ratio of max cover of discovered rect to correct rect
-    ratio (r1,r2,_) = 1 - ((fromIntegral $ abs $ rArea r1 - rArea r2) / (fromIntegral $ rArea r1))
+    ratio (r1,rs) = 1 - ((fromIntegral $ abs $ rArea r1 - rArea r2) / (fromIntegral $ rArea r1))
+      where r2 = minCoveringRect rs
     ratios = map ratio rs
     largestRatios = map largestRatio rs
     -- ratio of largest discovered rect to max covering rect
-    largestRatio (_,r2,rs)
+    largestRatio (_,rs)
       | rArea r2 == 0 = 0
       | otherwise = (fromIntegral $ largest ss) / (fromIntegral $ rArea r2)
       where
+        r2 = minCoveringRect rs
         ss = reverse $ sortBy (comparing rArea) rs
         largest [] = 0
         largest ss = rArea $ head ss
@@ -160,20 +96,19 @@ getResults rs = (snum, scorrect, scount, sratio, slargest)
     sratio = sum ratios
     slargest = sum largestRatios
 
--- | Exctracts the covering rect from the tuple
-getCoveringRect :: (R.Rectangle Int, R.Rectangle Int, [R.Rectangle Int]) -> R.Rectangle Int
-getCoveringRect (_,r,_) = r
-
 -- | Creates a quad forest from a pixel image.
 makeForest :: PixelImage -> IO QuadForest
-makeForest img = quadForestCreate img 16 4
+makeForest img = quadForestCreate 16 4 img
+
+-- | For excluding too small rectangles from the result.
+bySize (R.Rectangle _ _ w h) = w > 8 && h > 8 && w*h > 256
 
 -- | Examines a file using the thresholding method.
 handleFileThresh sourceFile = do
   print sourceFile
   oimg <- readFromFile $ "original/" ++ sourceFile
   -- smooth with a gaussian
-  pimg <- fromCVImage $ gaussianSmooth 2.3 7 oimg
+  pimg <- toPixelImage $ gaussianSmooth 2.3 7 oimg
   -- create the integral image
   int <- createIntegralImage pimg
   -- threshold using Feng's method with radius 7 and multiplier 3 for the
@@ -182,13 +117,14 @@ handleFileThresh sourceFile = do
   -- create connected components
   comp <- createConnectedComponents timg
   cimg <- drawConnectedComponents comp
-  saveImage ("threshseg/" ++ sourceFile ++ ".png") =<< toCVImage cimg
+  saveImage ("threshseg/" ++ sourceFile ++ ".png")
+    =<< expectByteRGB =<< fromPixelImage cimg
   -- read ground truth rectangles from a json file
   (Just es) <- readElementsFromFile $ "original/" ++ sourceFile ++ ".json"
   let
     rects = map fst es
-    crects = map compToRect $ components comp
-    scs = map (getIntersectingRects crects) rects
+    crects = map compToRect $ connectedComponents comp
+    scs = map (getIntersectingRects 0.9 crects) $ filter bySize rects
     rcs = getResults scs
   print rcs
   return $! rcs
@@ -197,15 +133,15 @@ handleFileThresh sourceFile = do
 handleFileGraph sourceFile = do
   print sourceFile
   -- segmentation results are generated using external program, load from file
-  simg <- readPNMPixelImage $ "graphseg/" ++ sourceFile ++ ".ppm"
+  simg <- CVSU.readPixelImage $ "graphseg/" ++ sourceFile ++ ".ppm"
   -- create connected components from the segmentation results
   scomp <- createConnectedComponents simg
   -- read ground truth rectangles from a json file
   (Just es) <- readElementsFromFile $ "original/" ++ sourceFile ++ ".json"
   let
     rects = map fst es
-    srects = map compToRect $ components scomp
-    scs = map (getIntersectingRects srects) rects
+    srects = map compToRect $ connectedComponents scomp
+    scs = map (getIntersectingRects 0.9 srects) $ filter bySize rects
     rcs = getResults scs
   print rcs
   return $! rcs
@@ -213,11 +149,11 @@ handleFileGraph sourceFile = do
 -- | Examines a file using the quad forest segmentation method
 handleFileQuad alpha overlapTree overlapSegment sourceFile = do
   print sourceFile
-  pimg <- readPixelImage $ "original/" ++ sourceFile
+  pimg <- CV.readPixelImage $ "original/" ++ sourceFile
   -- read ground truth rectangles from a json file
   (Just es) <- readElementsFromFile $ "original/" ++ sourceFile ++ ".json"
   -- create the forest using tree max size 16 and min size 4
-  forest <- quadForestCreate pimg 16 4
+  forest <- quadForestCreate 16 4 pimg
   withQuadForest forest $ \f -> do
     -- segment using the overlap method
     sf <- quadForestSegmentByOverlap alpha overlapTree overlapSegment f
@@ -226,8 +162,8 @@ handleFileQuad alpha overlapTree overlapSegment sourceFile = do
     drawForest ("quadseg/" ++ sourceFile ++ ".png") sf
     let
       rects = map fst es
-      frects = map segmentToRect segments
-      scs = map (getIntersectingRects frects) rects
+      frects = map segToRect segments
+      scs = map (getIntersectingRects 0.9 frects) $ filter bySize rects
       rcs = getResults scs
     print rcs
     return $! rcs
